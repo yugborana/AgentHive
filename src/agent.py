@@ -8,9 +8,11 @@ from dataclasses import dataclass, field
 from typing import Any, Callable
 
 from .messages import AssistantMessage, Message, SystemPrompt, ToolMessage, UserPrompt
+from .messages import AssistantMessage, Message, SystemPrompt, ToolMessage, UserPrompt
 from .tools import Tool
 from .result import OutputSchema
 from .llm import LLM, ToolSchema
+from .memory import MemoryStore
 
 
 @dataclass
@@ -42,10 +44,12 @@ class Agent:
         tools: list[Callable[..., Any]] | None = None,
         result_type: type | None = None,
         max_turns: int = 10,
+        memory: MemoryStore | None = None,
     ):
         self._llm = llm
         self._system_prompt = system_prompt
         self._max_turns = max_turns
+        self._memory = memory
 
         # Wrap raw Python functions into Tool objects
         self._tools: dict[str, Tool] = {}
@@ -63,6 +67,7 @@ class Agent:
         self,
         user_prompt: str,
         message_history: list[Message] | None = None,
+        session_id: str | None = None,
     ) -> AgentResult:
         """Run the agent. This is the entire engine.
 
@@ -85,16 +90,24 @@ class Agent:
             AgentResult with the final data and full message history.
         """
         # --- Step 1: Build the conversation ---
+        messages = []
+        if self._system_prompt:
+            messages.append(SystemPrompt(role="system", content=self._system_prompt))
+            
+        # Optional: Load historic conversation from DB
+        if session_id and self._memory:
+            db_history = await self._memory.get_messages(session_id)
+            messages.extend(db_history)
+            
+        # Optional: Manually injected conversation
         if message_history is not None:
-            messages: list[Message] = message_history.copy()
-        else:
-            messages = []
-            if self._system_prompt:
-                messages.append(
-                    SystemPrompt(role="system", content=self._system_prompt)
-                )
+            messages.extend(message_history)
 
+        # Append the new user prompt
         messages.append(UserPrompt(role="user", content=user_prompt))
+        
+        # Track where the *new* messages start so we only save those
+        start_index = len(messages) - 1
 
         # --- Step 2: Gather all tool schemas ---
         tool_schemas: list[ToolSchema] = [
@@ -102,6 +115,12 @@ class Agent:
         ]
         if self._output_schema:
             tool_schemas.append(self._output_schema.tool_schema)
+
+        # Helper to safely save state before returning
+        async def save_state():
+            if session_id and self._memory:
+                new_messages = [m for m in messages[start_index:] if m["role"] != "system"]
+                await self._memory.add_messages(session_id, new_messages)
 
         # --- Step 3: The Loop ---
         for turn in range(self._max_turns):
@@ -131,6 +150,7 @@ class Agent:
                     continue
                 else:
                     # Plain text is exactly what we wanted. Done!
+                    await save_state()
                     return AgentResult(
                         data=response.get("content", ""),
                         messages=messages,
@@ -155,9 +175,9 @@ class Agent:
                                 content=result,
                             )
                         )
-                        # Don't return — the loop continues, LLM tries again
                     else:
                         # Validation succeeded! The loop is over.
+                        await save_state()
                         return AgentResult(data=result, messages=messages)
 
                 # Is it a real tool?
@@ -188,10 +208,10 @@ class Agent:
                         )
                     )
 
-        # If we exhaust max_turns, return whatever we have
-        raise RuntimeError(
-            f"Agent exceeded {self._max_turns} turns without producing a final result."
-        )
+            await save_state()
+            raise RuntimeError(
+                f"Agent exceeded {self._max_turns} turns without producing a final result."
+            )
 
     def run_sync(self, user_prompt: str) -> AgentResult:
         """Convenience wrapper to run the agent synchronously.
@@ -205,24 +225,25 @@ class Agent:
         self,
         user_prompt: str,
         message_history: list[Message] | None = None,
+        session_id: str | None = None,
     ) -> AgentStream:
         """Run the agent and stream the output.
         
         Usage:
-            stream = agent.run_stream("Tell me a story")
+            stream = agent.run_stream("Tell me a story", session_id="user123")
             async for chunk in stream.stream_text():
                 print(chunk, end="")
             result = await stream.get_data()
         """
-        return AgentStream(self, user_prompt, message_history)
+        return AgentStream(self, user_prompt, message_history, session_id)
 
 
 class AgentStream:
     """Wraps an agent execution to provide streaming text and a final result."""
     
-    def __init__(self, agent: Agent, user_prompt: str, message_history: list[Message] | None):
+    def __init__(self, agent: Agent, user_prompt: str, message_history: list[Message] | None, session_id: str | None):
         self._queue = asyncio.Queue()
-        self._task = asyncio.create_task(self._run_loop(agent, user_prompt, message_history))
+        self._task = asyncio.create_task(self._run_loop(agent, user_prompt, message_history, session_id))
 
     async def stream_text(self) -> AsyncIterator[str]:
         """Iterate over text chunks as they arrive from the LLM."""
@@ -236,20 +257,23 @@ class AgentStream:
         """Wait for the agent to finish and get the final result."""
         return await self._task
 
-    async def _run_loop(self, agent: Agent, user_prompt: str, message_history: list[Message] | None) -> AgentResult:
+    async def _run_loop(self, agent: Agent, user_prompt: str, message_history: list[Message] | None, session_id: str | None) -> AgentResult:
         """The internal loop, adapted for streaming."""
         
         # --- Step 1: Build the conversation ---
+        messages = []
+        if agent._system_prompt:
+            messages.append(SystemPrompt(role="system", content=agent._system_prompt))
+            
+        if session_id and agent._memory:
+            db_history = await agent._memory.get_messages(session_id)
+            messages.extend(db_history)
+
         if message_history is not None:
-            messages: list[Message] = message_history.copy()
-        else:
-            messages = []
-            if agent._system_prompt:
-                messages.append(
-                    SystemPrompt(role="system", content=agent._system_prompt)
-                )
+            messages.extend(message_history)
 
         messages.append(UserPrompt(role="user", content=user_prompt))
+        start_index = len(messages) - 1
 
         # --- Step 2: Gather all tool schemas ---
         tool_schemas: list[ToolSchema] = [
@@ -257,6 +281,11 @@ class AgentStream:
         ]
         if agent._output_schema:
             tool_schemas.append(agent._output_schema.tool_schema)
+            
+        async def save_state():
+            if session_id and agent._memory:
+                new_messages = [m for m in messages[start_index:] if m["role"] != "system"]
+                await agent._memory.add_messages(session_id, new_messages)
 
         # --- Step 3: The Loop ---
         try:
@@ -289,6 +318,7 @@ class AgentStream:
                         )
                         continue
                     else:
+                        await save_state()
                         return AgentResult(data=response.get("content", ""), messages=messages)
 
                 # --- Case 2: Tool calls ---
@@ -309,6 +339,7 @@ class AgentStream:
                                 )
                             )
                         else:
+                            await save_state()
                             return AgentResult(data=result, messages=messages)
 
                     elif func_name in agent._tools:
@@ -335,6 +366,7 @@ class AgentStream:
                             )
                         )
 
+            await save_state()
             raise RuntimeError(f"Agent exceeded {agent._max_turns} turns without producing a final result.")
             
         finally:
