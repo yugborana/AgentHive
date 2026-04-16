@@ -5,6 +5,8 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 
+from collections.abc import AsyncIterator
+
 from ..messages import AssistantMessage, Message
 
 
@@ -60,3 +62,42 @@ class LLM(ABC):
               - tool_calls (the LLM wants to run a function)
         """
         raise NotImplementedError(f"{type(self).__name__} must implement chat()")
+
+    @abstractmethod
+    async def chat_stream(
+        self,
+        messages: list[Message],
+        tools: list[ToolSchema] | None = None,
+    ) -> StreamResponse:
+        """Send a conversation to the LLM and get a streaming response.
+
+        Returns:
+            A StreamResponse object that can be iterated for text chunks,
+            and provides the complete AssistantMessage when finished.
+        """
+        raise NotImplementedError(f"{type(self).__name__} must implement chat_stream()")
+
+class StreamResponse(ABC):
+    """A streaming response from an LLM.
+
+    Usage:
+        stream = await llm.chat_stream(messages)
+        async for chunk in stream:
+            print(chunk, end="", flush=True)
+            
+        final_message = stream.get_final_message()
+    """
+
+    @abstractmethod
+    def __aiter__(self) -> AsyncIterator[str]:
+        """Iterate over the text chunks as they arrive."""
+        ...
+
+    @abstractmethod
+    def get_final_message(self) -> AssistantMessage:
+        """Get the complete message after streaming is finished.
+        
+        This will contain the full text, OR the assembled tool calls
+        if the LLM decided to call tools instead of speaking.
+        """
+        ...

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
@@ -199,3 +200,143 @@ class Agent:
             result = agent.run_sync("What is Python?")
         """
         return asyncio.run(self.run(user_prompt))
+
+    def run_stream(
+        self,
+        user_prompt: str,
+        message_history: list[Message] | None = None,
+    ) -> AgentStream:
+        """Run the agent and stream the output.
+        
+        Usage:
+            stream = agent.run_stream("Tell me a story")
+            async for chunk in stream.stream_text():
+                print(chunk, end="")
+            result = await stream.get_data()
+        """
+        return AgentStream(self, user_prompt, message_history)
+
+
+class AgentStream:
+    """Wraps an agent execution to provide streaming text and a final result."""
+    
+    def __init__(self, agent: Agent, user_prompt: str, message_history: list[Message] | None):
+        self._queue = asyncio.Queue()
+        self._task = asyncio.create_task(self._run_loop(agent, user_prompt, message_history))
+
+    async def stream_text(self) -> AsyncIterator[str]:
+        """Iterate over text chunks as they arrive from the LLM."""
+        while True:
+            chunk = await self._queue.get()
+            if chunk is None:  # Sentinel value indicating the stream is done
+                break
+            yield chunk
+
+    async def get_data(self) -> AgentResult:
+        """Wait for the agent to finish and get the final result."""
+        return await self._task
+
+    async def _run_loop(self, agent: Agent, user_prompt: str, message_history: list[Message] | None) -> AgentResult:
+        """The internal loop, adapted for streaming."""
+        
+        # --- Step 1: Build the conversation ---
+        if message_history is not None:
+            messages: list[Message] = message_history.copy()
+        else:
+            messages = []
+            if agent._system_prompt:
+                messages.append(
+                    SystemPrompt(role="system", content=agent._system_prompt)
+                )
+
+        messages.append(UserPrompt(role="user", content=user_prompt))
+
+        # --- Step 2: Gather all tool schemas ---
+        tool_schemas: list[ToolSchema] = [
+            tool.schema for tool in agent._tools.values()
+        ]
+        if agent._output_schema:
+            tool_schemas.append(agent._output_schema.tool_schema)
+
+        # --- Step 3: The Loop ---
+        try:
+            for turn in range(agent._max_turns):
+                # (a) Send everything to the LLM (STREAMING)
+                stream_response = await agent._llm.chat_stream(
+                    messages,
+                    tools=tool_schemas if tool_schemas else None,
+                )
+
+                # Yield all incoming text chunks to the user
+                async for chunk in stream_response:
+                    await self._queue.put(chunk)
+
+                # After text stream ends, get the full assembled message
+                response = stream_response.get_final_message()
+                messages.append(response)
+
+                # (b) Did the LLM call any tools?
+                tool_calls = response.get("tool_calls")
+
+                if not tool_calls:
+                    # --- Case 1: Plain text response ---
+                    if agent._output_schema:
+                        messages.append(
+                            UserPrompt(
+                                role="user",
+                                content="Please use the final_result tool to provide your response.",
+                            )
+                        )
+                        continue
+                    else:
+                        return AgentResult(data=response.get("content", ""), messages=messages)
+
+                # --- Case 2: Tool calls ---
+                for tc in tool_calls:
+                    func_name = tc["function"]["name"]
+                    arguments_json = tc["function"]["arguments"]
+                    tool_call_id = tc["id"]
+
+                    if agent._output_schema and func_name == "final_result":
+                        result = agent._output_schema.validate(arguments_json)
+
+                        if isinstance(result, str):
+                            messages.append(
+                                ToolMessage(
+                                    role="tool",
+                                    tool_call_id=tool_call_id,
+                                    content=result,
+                                )
+                            )
+                        else:
+                            return AgentResult(data=result, messages=messages)
+
+                    elif func_name in agent._tools:
+                        try:
+                            result_str = await agent._tools[func_name].execute(arguments_json)
+                        except Exception as e:
+                            result_str = f"Tool execution error: {e}"
+
+                        messages.append(
+                            ToolMessage(
+                                role="tool",
+                                tool_call_id=tool_call_id,
+                                content=result_str,
+                            )
+                        )
+
+                    else:
+                        messages.append(
+                            ToolMessage(
+                                role="tool",
+                                tool_call_id=tool_call_id,
+                                content=f"Error: Unknown tool '{func_name}'. "
+                                f"Available tools: {list(agent._tools.keys())}",
+                            )
+                        )
+
+            raise RuntimeError(f"Agent exceeded {agent._max_turns} turns without producing a final result.")
+            
+        finally:
+            # Always push the sentinel so the stream_text iterator finishes
+            await self._queue.put(None)
