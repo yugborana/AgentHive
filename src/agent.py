@@ -214,12 +214,37 @@ class Agent:
             )
 
     def run_sync(self, user_prompt: str) -> AgentResult:
-        """Convenience wrapper to run the agent synchronously.
-
-        Usage:
-            result = agent.run_sync("What is Python?")
-        """
+        """Convenience wrapper to run the agent synchronously."""
         return asyncio.run(self.run(user_prompt))
+
+    def as_tool(self, name: str, description: str) -> Callable:
+        """Wrap this agent into a standalone tool that another agent can call.
+        
+        This implements the "Agent Delegation" Multi-Agent pattern. 
+        When the parent agent calls this tool, it suspends, and this
+        child agent takes over in a fresh loop until it reaches a final answer,
+        which is then passed back to the parent.
+        """
+        async def delegate_agent_tool(instruction_for_agent: str) -> str:
+            # We run a brand new autonomous loop for the child agent!
+            # We don't pass session_id because we want to keep the 
+            # child's thought process isolated from the parent's memory.
+            result = await self.run(instruction_for_agent)
+            
+            # If the child agent returned a structured Pydantic object,
+            # we cast it to a string so the parent LLM can read it.
+            return str(result.data)
+
+        # We must overwrite the __name__ and __doc__ so our Tool Introspection
+        # engine creates the correct JSON schema for the parent LLM to see!
+        delegate_agent_tool.__name__ = name
+        delegate_agent_tool.__doc__ = (
+            f"{description}\n\n"
+            "Args:\n"
+            "    instruction_for_agent: The prompt or task to give to the sub-agent."
+        )
+        
+        return delegate_agent_tool
 
     def run_stream(
         self,
